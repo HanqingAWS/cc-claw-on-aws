@@ -1,0 +1,523 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CC-CLAW on AWS - code-server/cc with CloudFront HTTPS access'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: EC2 Instance Configuration
+        Parameters:
+          - InstanceType
+          - OSType
+          - AL2023AmiId
+          - Ubuntu2404AmiId
+          - SysPassword
+      - Label:
+          default: Claude Code / Bedrock Configuration
+        Parameters:
+          - BedrockModel
+          - EnablePromptCaching1H
+      - Label:
+          default: cc-connect / Messaging Platforms
+        Parameters:
+          - EnablePersonalWeChat
+    ParameterLabels:
+      InstanceType:
+        default: EC2 Instance Type
+      OSType:
+        default: Operating System
+      AL2023AmiId:
+        default: Amazon Linux 2023 AMI (auto-resolved)
+      Ubuntu2404AmiId:
+        default: Ubuntu 24.04 AMI (auto-resolved)
+      SysPassword:
+        default: code-server Login Password
+      BedrockModel:
+        default: Default Bedrock Model
+      EnablePromptCaching1H:
+        default: Enable 1-Hour Prompt Caching
+      EnablePersonalWeChat:
+        default: Enable Personal WeChat (Weixin) Channel
+
+Parameters:
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t4g.large
+    AllowedValues:
+      - t4g.large
+      - t4g.xlarge
+      - t4g.2xlarge
+      - c6g.large
+      - c6g.xlarge
+      - c6g.2xlarge
+      - m6g.large
+      - m6g.xlarge
+      - m6g.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+  OSType:
+    Type: String
+    Description: Operating system for the EC2 instance
+    Default: AmazonLinux2023
+    AllowedValues:
+      - AmazonLinux2023
+      - Ubuntu2404
+    ConstraintDescription: Must be AmazonLinux2023 or Ubuntu2404.
+
+  AL2023AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 ARM64 AMI (resolved automatically)
+
+  Ubuntu2404AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 ARM64 AMI (resolved automatically)
+
+  SysPassword:
+    Type: String
+    Description: code-server login password
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9!@#$%^&*()_+=-]*'
+    ConstraintDescription: Must contain only alphanumeric and special characters.
+
+  BedrockModel:
+    Type: String
+    Description: Bedrock model ID for Claude Code
+    Default: global.anthropic.claude-sonnet-4-6
+    AllowedValues:
+      - global.anthropic.claude-opus-4-5-20251101-v1:0
+      - global.anthropic.claude-opus-4-6-v1
+      - us.anthropic.claude-opus-4-7
+      - global.anthropic.claude-sonnet-4-5-20250929-v1:0
+      - global.anthropic.claude-sonnet-4-6
+      - global.anthropic.claude-haiku-4-5-20251001-v1:0
+
+  EnablePersonalWeChat:
+    Type: String
+    Description: Enable personal WeChat (Weixin) channel (requires beta version of cc-connect)
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnablePromptCaching1H:
+    Type: String
+    Description: Enable 1-hour prompt caching on Bedrock (longer cache TTL, different pricing)
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  IsAmazonLinux: !Equals [!Ref OSType, AmazonLinux2023]
+
+Resources:
+  # ==================== VPC ====================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: CC-CLAW-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: CC-CLAW-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: CC-CLAW-Public-Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: CC-CLAW-Public-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ==================== Prefix List Lookup (Custom Resource) ====================
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribePrefixLists
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: '*'
+
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  ec2 = boto3.client('ec2')
+                  props = event['ResourceProperties']
+                  result = {}
+                  for key in ['Ec2InstanceConnectPrefixListId', 'CloudFrontPrefixListId']:
+                      name = props[key]
+                      resp = ec2.describe_managed_prefix_lists(
+                          Filters=[{'Name': 'prefix-list-name', 'Values': [name]}]
+                      )
+                      lists = resp.get('PrefixLists', [])
+                      if lists:
+                          result[key] = lists[0]['PrefixListId']
+                      else:
+                          raise Exception(f'Prefix list not found: {name}')
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  PrefixListLookup:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      Ec2InstanceConnectPrefixListId: !Sub com.amazonaws.${AWS::Region}.ec2-instance-connect
+      CloudFrontPrefixListId: com.amazonaws.global.cloudfront.origin-facing
+
+  # ==================== Security Group ====================
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for CC-CLAW EC2 instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourcePrefixListId: !GetAtt PrefixListLookup.Ec2InstanceConnectPrefixListId
+          Description: SSH access through EC2 Instance Connect
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourcePrefixListId: !GetAtt PrefixListLookup.CloudFrontPrefixListId
+          Description: code-server port for CloudFront origin
+
+  # ==================== IAM ====================
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BedrockInvokeModel
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListInferenceProfiles
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # ==================== EC2 ====================
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref PublicSubnet
+      ImageId: !If [IsAmazonLinux, !Ref AL2023AmiId, !Ref Ubuntu2404AmiId]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+              #!/bin/bash
+              set -e
+
+              # Ensure HOME is set (cloud-init may not set it)
+              export HOME=/root
+
+              # Detect OS user
+              if [ -d /home/ubuntu ]; then
+                  SYS_USER=ubuntu
+              else
+                  SYS_USER=ec2-user
+              fi
+
+              # Install dependencies
+              if command -v dnf >/dev/null 2>&1; then
+                  sudo dnf install -y tar gzip git
+              elif command -v yum >/dev/null 2>&1; then
+                  sudo yum install -y tar gzip git
+              elif command -v apt-get >/dev/null 2>&1; then
+                  sudo apt-get update -y
+                  sudo apt-get install -y curl tar gzip git
+              fi
+
+              # Install Python 3.13 and Node.js
+              echo "Installing Python 3.13..."
+              if command -v dnf >/dev/null 2>&1; then
+                  sudo dnf install -y python3.13 python3.13-pip
+              elif command -v apt-get >/dev/null 2>&1; then
+                  sudo add-apt-repository -y ppa:deadsnakes/ppa
+                  sudo apt-get update -y
+                  sudo apt-get install -y python3.13 python3.13-venv python3-pip
+              fi
+
+              echo "Installing Node.js latest LTS version..."
+              NODE_VERSION=$(curl -fsSL https://nodejs.org/dist/index.json | python3 -c "import sys,json; print([v['version'][1:] for v in json.load(sys.stdin) if v['lts']][0])")
+              ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')
+              curl -fsSL "https://nodejs.org/dist/v${!NODE_VERSION}/node-v${!NODE_VERSION}-linux-${!ARCH}.tar.xz" | tar -xJ -C /usr/local --strip-components=1
+
+              # Install Claude Code via native installer
+              echo "Installing Claude Code..."
+              sudo -u $SYS_USER bash -lc 'curl -fsSL https://claude.ai/install.sh | bash'
+
+              # Configure Claude Code to use Bedrock
+              echo "Configuring Claude Code for Bedrock..."
+              sudo -u $SYS_USER mkdir -p /home/$SYS_USER/.claude
+              CACHING_1H="${EnablePromptCaching1H}"
+
+              # Build settings.json with conditional entries
+              SETTINGS_ENV="\"CLAUDE_CODE_USE_BEDROCK\": \"1\", \"ANTHROPIC_MODEL\": \"${BedrockModel}\", \"AWS_REGION\": \"${AWS::Region}\", \"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"global.anthropic.claude-haiku-4-5-20251001-v1:0\", \"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"global.anthropic.claude-sonnet-4-6\", \"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"global.anthropic.claude-opus-4-6-v1\""
+              if [ "$CACHING_1H" = "true" ]; then
+                  SETTINGS_ENV="$SETTINGS_ENV, \"ENABLE_PROMPT_CACHING_1H_BEDROCK\": \"1\""
+              fi
+              cat > /home/$SYS_USER/.claude/settings.json <<SETTINGSEOF
+              { "env": { $SETTINGS_ENV } }
+              SETTINGSEOF
+              # Pretty-print and fix indentation
+              if command -v python3 >/dev/null 2>&1; then
+                  python3 -m json.tool /home/$SYS_USER/.claude/settings.json > /tmp/settings_fmt.json && mv /tmp/settings_fmt.json /home/$SYS_USER/.claude/settings.json
+              fi
+              sed -i 's/^              //' /home/$SYS_USER/.claude/settings.json
+              chown -R $SYS_USER:$SYS_USER /home/$SYS_USER/.claude
+
+              # Install cc-connect (bridge Claude Code to WeChat/Feishu)
+              echo "Installing cc-connect..."
+              ENABLE_WEIXIN="${EnablePersonalWeChat}"
+              if [ "$ENABLE_WEIXIN" = "true" ]; then
+                  npm install -g cc-connect@beta
+              else
+                  npm install -g cc-connect
+              fi
+
+              # Create cc-connect config directory with example config
+              echo "Creating cc-connect config..."
+              sudo -u $SYS_USER mkdir -p /home/$SYS_USER/.cc-connect
+              cat > /home/$SYS_USER/.cc-connect/config.toml <<CCEOF
+              # cc-connect configuration
+              # Uncomment and configure the platforms you need
+              attachment_send = "on"
+              language = "zh"
+
+              [log]
+              level = "info" # debug, info, warn, error
+
+              [[projects]]
+              name = "my-project"
+              # admin_from = "User_ID"
+
+              [projects.agent]
+              type = "claudecode"
+              [projects.agent.options]
+              mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassPermissions" (yolo)
+              work_dir = "/home/$SYS_USER/projects"
+
+              # [[projects.platforms]]
+              # type = "feishu"
+              # [projects.platforms.options]
+              # app_id = ""
+              # app_secret = ""
+              # allow_from = "*"
+
+              # [[projects.platforms]]
+              # type = "weixin"
+              # [projects.platforms.options]
+              # token = "your-ilink-bot-bearer-token"
+              # base_url = "https://ilinkai.weixin.qq.com"
+              # cdn_base_url = "https://novac2c.cdn.weixin.qq.com/c2c"
+              # long_poll_timeout_ms = 35000
+              CCEOF
+              sed -i 's/^              //' /home/$SYS_USER/.cc-connect/config.toml
+              chown -R $SYS_USER:$SYS_USER /home/$SYS_USER/.cc-connect
+
+              # Create projects directory
+              mkdir -p /home/$SYS_USER/projects
+              chown $SYS_USER:$SYS_USER /home/$SYS_USER/projects
+
+              # install cc-connect as daemon
+              echo "Installing cc-connect as daemon..."
+              # Enable systemd user session for cloud-init environment
+              loginctl enable-linger $SYS_USER
+              export XDG_RUNTIME_DIR=/run/user/$(id -u $SYS_USER)
+              su - $SYS_USER -c "export XDG_RUNTIME_DIR=/run/user/\$(id -u) && cc-connect daemon install --work-dir ~/.cc-connect"
+              su - $SYS_USER -c "export XDG_RUNTIME_DIR=/run/user/\$(id -u) && cc-connect daemon start --work-dir ~/.cc-connect"
+
+              echo "=== Claude Code and cc-connect installation complete ==="
+
+              # Install code-server via official install script
+              echo "Installing code-server..."
+              curl -fsSL https://code-server.dev/install.sh | sh
+
+              # Configure code-server
+              mkdir -p /home/$SYS_USER/.config/code-server
+              cat > /home/$SYS_USER/.config/code-server/config.yaml <<CSEOF
+              bind-addr: 0.0.0.0:8080
+              auth: password
+              password: ${SysPassword}
+              cert: false
+              CSEOF
+              sed -i 's/^              //' /home/$SYS_USER/.config/code-server/config.yaml
+              chown -R $SYS_USER:$SYS_USER /home/$SYS_USER/.config
+
+              # Create systemd service for code-server
+              cat > /etc/systemd/system/code-server.service <<SVCEOF
+              [Unit]
+              Description=code-server
+              After=network.target
+
+              [Service]
+              Type=simple
+              User=$SYS_USER
+              WorkingDirectory=/home/$SYS_USER/projects
+              ExecStart=/usr/bin/code-server --bind-addr 0.0.0.0:8080 /home/$SYS_USER/projects
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+              SVCEOF
+              sed -i 's/^              //' /etc/systemd/system/code-server.service
+
+              # Start code-server
+              systemctl daemon-reload
+              systemctl enable code-server
+              systemctl start code-server
+
+              echo "=== code-server installation complete ==="
+              echo "Listening on port 8080"
+      Tags:
+        - Key: Name
+          Value: CC-CLAW-Server
+
+  # ==================== CloudFront ====================
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: EC2Instance
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: CC-CLAW CloudFront Distribution
+        DefaultCacheBehavior:
+          TargetOriginId: CodeServerOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+          Compress: true
+        Origins:
+          - Id: CodeServerOrigin
+            DomainName: !GetAtt EC2Instance.PublicDnsName
+            CustomOriginConfig:
+              HTTPPort: 8080
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        HttpVersion: http2
+        PriceClass: PriceClass_All
+
+Outputs:
+  CloudFrontURL:
+    Description: HTTPS URL to access code-server via CloudFront
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+  EC2DirectURL:
+    Description: Direct HTTP URL to EC2 code-server (for debugging)
+    Value: !Sub http://${EC2Instance.PublicIp}:8080
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
