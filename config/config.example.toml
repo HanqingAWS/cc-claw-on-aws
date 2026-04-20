@@ -28,6 +28,7 @@ type = "claudecode"
 [projects.agent.options]
 mode = "bypassPermissions" # "default" | "acceptEdits" | "plan" | "bypassPermissions"
 work_dir = "/home/ec2-user/projects"
+allowed_tools = ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "WebFetch", "TodoRead", "TodoWrite"]
 
 # --- Feishu / Lark ---
 # Create app: https://open.feishu.cn

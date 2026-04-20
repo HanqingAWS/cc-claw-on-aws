@@ -421,6 +421,7 @@ type = "claudecode"
 [projects.agent.options]
 mode = "$AGENT_MODE"
 work_dir = "$WORK_DIR"
+allowed_tools = ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "WebFetch", "TodoRead", "TodoWrite"]
 $PLATFORM_CONFIG
 CCEOF
 

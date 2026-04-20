@@ -397,6 +397,7 @@ Resources:
               [projects.agent.options]
               mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassPermissions" (yolo)
               work_dir = "/home/$SYS_USER/projects"
+              allowed_tools = ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "WebFetch", "TodoRead", "TodoWrite"]
 
               # [[projects.platforms]]
               # type = "feishu"
