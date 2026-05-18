@@ -432,17 +432,37 @@ CCEOF
     # Install as daemon
     if [ "$PLATFORM_CHOICE" != "7" ]; then
         log_info "Installing cc-connect daemon..."
+        UID_NUM=$(id -u "$SYS_USER")
+        XDG_DIR="/run/user/$UID_NUM"
+
+        # Enable linger and bootstrap the user systemd manager so its bus socket
+        # exists before we try to install a --user service. Without this, fresh
+        # cloud images often fail with "systemd user session not available".
         loginctl enable-linger "$SYS_USER" 2>/dev/null || true
-        XDG_DIR="/run/user/$(id -u "$SYS_USER")"
-        if [ "$(id -u)" -eq 0 ]; then
-            su - "$SYS_USER" -c "export XDG_RUNTIME_DIR=$XDG_DIR && cc-connect daemon install --work-dir $CC_DIR" || true
-            su - "$SYS_USER" -c "export XDG_RUNTIME_DIR=$XDG_DIR && cc-connect daemon start --work-dir $CC_DIR" || true
+        systemctl start "user@${UID_NUM}.service" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -S "$XDG_DIR/systemd/private" ] && break
+            sleep 1
+        done
+
+        run_as_user() {
+            if [ "$(id -u)" -eq 0 ]; then
+                sudo -u "$SYS_USER" XDG_RUNTIME_DIR="$XDG_DIR" "$@"
+            else
+                XDG_RUNTIME_DIR="$XDG_DIR" "$@"
+            fi
+        }
+
+        if [ -S "$XDG_DIR/systemd/private" ] && \
+           run_as_user cc-connect daemon install --work-dir "$CC_DIR" && \
+           run_as_user cc-connect daemon start --work-dir "$CC_DIR"; then
+            log_info "cc-connect daemon started (systemd user)."
         else
-            export XDG_RUNTIME_DIR=$XDG_DIR
-            cc-connect daemon install --work-dir "$CC_DIR" || true
-            cc-connect daemon start --work-dir "$CC_DIR" || true
+            log_warn "User systemd unavailable — falling back to system service."
+            sudo cc-connect daemon install --work-dir "$CC_DIR" || true
+            sudo cc-connect daemon start --work-dir "$CC_DIR" || true
+            log_info "cc-connect daemon started (systemd system)."
         fi
-        log_info "cc-connect daemon started."
     fi
 
     log_info "cc-connect installed. Config: $CC_DIR/config.toml"
